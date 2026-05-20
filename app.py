@@ -32,6 +32,8 @@ POLOS = {
     "Empregador / Empresa / RH": "empregador",
 }
 
+RESPOSTAS_ONBOARDING = set(list(POLOS.keys()) + list(MAPA_VINCULO.keys()))
+
 PADROES_INJECTION = [
     r"ignore\s+(tudo|todas|todos|o\s+que|as\s+instru[cç][oõ]es)",
     r"esqueça\s+(tudo|o\s+que\s+foi|as\s+instru[cç][oõ]es|seu\s+papel)",
@@ -59,6 +61,28 @@ _RE_INJECTION = re.compile(
 
 def detectar_injection(texto: str) -> bool:
     return bool(_RE_INJECTION.search(texto))
+
+def validar_pergunta(texto: str, historico: list) -> tuple[bool, str]:
+    perguntas_anteriores = [
+        m for m in historico
+        if m["role"] == "user" and m["content"] not in RESPOSTAS_ONBOARDING
+    ]
+
+    if perguntas_anteriores:
+        return True, ""
+
+    texto_limpo = texto.strip()
+
+    if len(texto_limpo) < 5:
+        return False, "Pode detalhar um pouco mais sua dúvida? Preciso de mais contexto para consultar a legislação corretamente. 😊"
+
+    if re.fullmatch(r'[\W_]+', texto_limpo, flags=re.UNICODE):
+        return False, "Pode detalhar um pouco mais sua dúvida? Preciso de mais contexto para consultar a legislação corretamente. 😊"
+
+    if len(re.findall(r'\b\w+\b', texto_limpo)) < 2:
+        return False, "Pode detalhar um pouco mais sua dúvida? Preciso de mais contexto para consultar a legislação corretamente. 😊"
+
+    return True, ""
 
 
 @st.cache_resource
@@ -231,6 +255,7 @@ def gerar_resposta(pergunta: str, documentos: list, contexto: dict, client) -> s
         - NÃO use frases como "não presente nos materiais", "conforme o contexto fornecido", "com base nos trechos" ou similares. Responda como um especialista, sem expor a mecânica interna do sistema.
         - NÃO numere os blocos da resposta (não escreva "1. Resposta direta", "2. Fundamentação"). Use prosa fluida com parágrafos.
         - Seja objetivo. Evite jargão excessivo e textos longos demais.
+        - Se a pergunta não tiver relação com direito trabalhista, CLT, contratos de trabalho, FGTS, férias, rescisão, salário, jornada ou qualquer outro tema de legislação trabalhista brasileira, NÃO responda o conteúdo da pergunta. Responda apenas: "Só consigo ajudar com dúvidas sobre legislação trabalhista. Se tiver uma dúvida sobre seus direitos ou obrigações no trabalho, pode mandar!"
         - Termine com UMA linha curta: "_Informação geral — para seu caso, consulte um advogado trabalhista._"
         - NÃO se apresente como IA — o app já informa isso ao usuário."""
 
@@ -410,11 +435,20 @@ def main():
     if not pergunta:
         return
 
+    valida, motivo = validar_pergunta(pergunta, st.session_state["historico"])
+    if not valida:
+        with st.chat_message("user"):
+            st.markdown(pergunta)
+        st.session_state["historico"].append({"role": "user", "content": pergunta})
+        with st.chat_message("assistant"):
+            st.markdown(motivo)
+        st.session_state["historico"].append({"role": "assistant", "content": motivo})
+        return
+
     if detectar_injection(pergunta):
         with st.chat_message("user"):
             st.markdown(pergunta)
         st.session_state["historico"].append({"role": "user", "content": pergunta})
-
         resposta_bloqueio = (
             "Só consigo responder dúvidas sobre legislação trabalhista. "
             "Se tiver uma pergunta sobre direitos ou obrigações no trabalho, pode mandar! 👍"
