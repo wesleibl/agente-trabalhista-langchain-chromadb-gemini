@@ -1,6 +1,6 @@
 .env
 chroma_db/
-chroma_rh/
 .venv/
 __pycache__/
 *.pycchroma_rh/
+.streamlit/secrets.toml

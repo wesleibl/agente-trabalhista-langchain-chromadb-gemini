@@ -5,6 +5,6 @@ google-genai
 streamlit
 chromadb
 pypdf
-dotenv
 beautifulsoup4
 lxml
+langfuse>=3.0.0

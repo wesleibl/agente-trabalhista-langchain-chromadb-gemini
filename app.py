@@ -1,19 +1,46 @@
 import os
 import re
+import uuid
 import streamlit as st
 from langchain_community.vectorstores import Chroma
 from google import genai
 from google.genai.errors import ServerError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from dotenv import load_dotenv
-
-load_dotenv()
+from langfuse import get_client
 
 PERSIST_DIRECTORY  = "./chroma_rh"
 EMBEDDING_MODEL    = "models/gemini-embedding-001"
 LLM_MODEL          = "gemini-2.5-flash"
 LLM_MODEL_FALLBACK = "gemini-2.5-flash-lite"
 BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
+
+os.environ["LANGFUSE_PUBLIC_KEY"] = st.secrets["LANGFUSE_PUBLIC_KEY"]
+os.environ["LANGFUSE_SECRET_KEY"] = st.secrets["LANGFUSE_SECRET_KEY"]
+os.environ["LANGFUSE_HOST"]       = st.secrets.get("LANGFUSE_HOST", "https://cloud.langfuse.com")
+os.environ["GOOGLE_API_KEY"]      = st.secrets["GOOGLE_API_KEY"]
+
+@st.cache_resource
+def get_langfuse():
+    """Cliente singleton thread-safe, conforme docs do Langfuse v3."""
+    return get_client()
+
+@st.cache_resource
+def get_genai_client():
+    return genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+
+@st.cache_resource
+def carregar_vectorstore():
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+    if not os.path.exists(PERSIST_DIRECTORY):
+        st.error("⚠️ Banco vetorial não encontrado. Rode primeiro: python indexar.py")
+        st.stop()
+
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+    return Chroma(
+        persist_directory=PERSIST_DIRECTORY,
+        embedding_function=embeddings
+    )
 
 @retry(
     retry=retry_if_exception_type(ServerError),
@@ -22,8 +49,31 @@ BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
     reraise=True,
 )
 def _gerar_com_modelo(client, prompt: str, modelo: str) -> str:
-    response = client.models.generate_content(model=modelo, contents=prompt)
-    return response.text
+    """Chama o Gemini e registra como `generation` no trace atual."""
+    langfuse = get_langfuse()
+    with langfuse.start_as_current_observation(
+        as_type="generation",
+        name="gemini_call",
+        model=modelo,
+        input=prompt,
+    ) as generation:
+        response = client.models.generate_content(model=modelo, contents=prompt)
+        texto = response.text
+
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            generation.update(
+                output=texto,
+                usage_details={
+                    "input":  getattr(usage, "prompt_token_count", 0),
+                    "output": getattr(usage, "candidates_token_count", 0),
+                    "total":  getattr(usage, "total_token_count", 0),
+                },
+            )
+        else:
+            generation.update(output=texto)
+
+        return texto
 
 def chamar_llm(client, prompt: str) -> str:
     try:
@@ -78,66 +128,82 @@ def coletar_contexto_usuario():
     st.info("👈 Preencha seu perfil na barra lateral para começar.")
     return None
 
-@st.cache_resource
-def carregar_vectorstore():
-    from langchain_google_genai import GoogleGenerativeAIEmbeddings
-
-    if not os.path.exists(PERSIST_DIRECTORY):
-        st.error("⚠️ Banco vetorial não encontrado. Rode primeiro: python indexar.py")
-        st.stop()
-
-    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
-    return Chroma(
-        persist_directory=PERSIST_DIRECTORY,
-        embedding_function=embeddings
-    )
-
 def buscar_documentos(pergunta: str, vectorstore, contexto: dict, k: int = 8):
+    langfuse = get_langfuse()
     tipo = contexto.get("tipo_vinculo", "geral")
 
-    if tipo == "pj":
-        filtro = {"tipo_trabalhador": {"$in": ["pj", "geral"]}}
-        return vectorstore.similarity_search(pergunta, k=k, filter=filtro)
+    with langfuse.start_as_current_observation(
+        as_type="span",
+        name="retrieval",
+        input={"pergunta": pergunta, "k": k, "tipo_vinculo": tipo},
+    ) as span:
+        if tipo == "pj":
+            filtro = {"tipo_trabalhador": {"$in": ["pj", "geral"]}}
+            docs = vectorstore.similarity_search(pergunta, k=k, filter=filtro)
+        elif tipo != "geral":
+            filtro = {"tipo_trabalhador": {"$in": [tipo, "clt_geral", "geral"]}}
+            docs = vectorstore.similarity_search(pergunta, k=k, filter=filtro)
+        else:
+            docs = vectorstore.similarity_search(pergunta, k=k)
 
-    if tipo != "geral":
-        filtro = {"tipo_trabalhador": {"$in": [tipo, "clt_geral", "geral"]}}
-        return vectorstore.similarity_search(pergunta, k=k, filter=filtro)
-
-    return vectorstore.similarity_search(pergunta, k=k)
+        span.update(output={
+            "n_docs": len(docs),
+            "fontes": [
+                {
+                    "id_legislacao": d.metadata.get("id_legislacao"),
+                    "artigo":        d.metadata.get("artigo"),
+                }
+                for d in docs
+            ],
+        })
+        return docs
 
 def rerank_documentos(pergunta: str, documentos: list, client) -> list:
-    trechos = ""
-    for i, doc in enumerate(documentos, 1):
-        fonte  = doc.metadata.get("id_legislacao", "N/A")
-        artigo = doc.metadata.get("artigo", "N/A")
-        trechos += f"\n[{i}] {fonte} — {artigo}:\n{doc.page_content[:400]}\n"
+    langfuse = get_langfuse()
 
-    prompt = f"""Você é um avaliador jurídico trabalhista.
-        Dada a pergunta abaixo, avalie cada trecho numerado de 0 a 10 por relevância.
-        0 = irrelevante, 10 = responde diretamente a pergunta.
+    with langfuse.start_as_current_observation(
+        as_type="span",
+        name="rerank",
+        input={"pergunta": pergunta, "n_docs_entrada": len(documentos)},
+    ) as span:
+        trechos = ""
+        for i, doc in enumerate(documentos, 1):
+            fonte  = doc.metadata.get("id_legislacao", "N/A")
+            artigo = doc.metadata.get("artigo", "N/A")
+            trechos += f"\n[{i}] {fonte} — {artigo}:\n{doc.page_content[:400]}\n"
 
-        Pergunta: "{pergunta}"
+        prompt = f"""Você é um avaliador jurídico trabalhista.
+            Dada a pergunta abaixo, avalie cada trecho numerado de 0 a 10 por relevância.
+            0 = irrelevante, 10 = responde diretamente a pergunta.
 
-        Trechos:
-        {trechos}
+            Pergunta: "{pergunta}"
 
-        Responda APENAS neste formato, um por linha, sem explicações:
-        1: <nota>
-        2: <nota>
-        3: <nota>"""
+            Trechos:
+            {trechos}
 
-    texto_resposta = chamar_llm(client, prompt)
+            Responda APENAS neste formato, um por linha, sem explicações:
+            1: <nota>
+            2: <nota>
+            3: <nota>"""
 
-    notas = {}
-    for linha in texto_resposta.strip().split("\n"):
-        match = re.match(r'(\d+):\s*([\d.]+)', linha)
-        if match:
-            notas[int(match.group(1))] = float(match.group(2))
+        texto_resposta = chamar_llm(client, prompt)
 
-    indexados = [(i + 1, doc) for i, doc in enumerate(documentos)]
-    return [doc for _, doc in sorted(indexados, key=lambda x: notas.get(x[0], 0), reverse=True)]
+        notas = {}
+        for linha in texto_resposta.strip().split("\n"):
+            match = re.match(r'(\d+):\s*([\d.]+)', linha)
+            if match:
+                notas[int(match.group(1))] = float(match.group(2))
 
-def gerar_resposta(pergunta: str, documentos: list, contexto: dict, client: genai.Client) -> str:
+        indexados = [(i + 1, doc) for i, doc in enumerate(documentos)]
+        reordenado = [doc for _, doc in sorted(indexados, key=lambda x: notas.get(x[0], 0), reverse=True)]
+
+        span.update(output={
+            "notas": notas,
+            "ordem_final": [d.metadata.get("artigo") for d in reordenado[:5]],
+        })
+        return reordenado
+
+def gerar_resposta(pergunta: str, documentos: list, contexto: dict, client) -> str:
     polo_label = "empregado/trabalhador" if contexto["polo"] == "empregado" else "empregador/empresa"
 
     contexto_juridico = ""
@@ -175,14 +241,54 @@ def gerar_resposta(pergunta: str, documentos: list, contexto: dict, client: gena
 
     return chamar_llm(client, prompt)
 
+def processar_pergunta(pergunta: str, vs, contexto: dict, client, session_id: str):
+    """Orquestra retrieval -> rerank -> generation dentro de um único trace."""
+    langfuse = get_langfuse()
+
+    with langfuse.start_as_current_observation(
+        as_type="span",
+        name="pipeline_juridico",
+        input=pergunta,
+    ) as trace_root:
+        langfuse.update_current_trace(
+            session_id=session_id,
+            user_id=f"{contexto['polo']}__{contexto['tipo_vinculo']}",
+            tags=[contexto["polo"], contexto["tipo_vinculo"]],
+            metadata={
+                "polo": contexto["polo"],
+                "tipo_vinculo": contexto["tipo_vinculo"],
+            },
+        )
+
+        docs            = buscar_documentos(pergunta, vs, contexto)
+        docs_reranked   = rerank_documentos(pergunta, docs, client)
+        resposta        = gerar_resposta(pergunta, docs_reranked, contexto, client)
+
+        trace_root.update(output=resposta)
+        return resposta, docs_reranked
+
 def main():
     st.set_page_config(page_title="Agente Jurídico Trabalhista", page_icon="⚖️")
+
+    LIMITE_PERGUNTAS = 5
+
+    if "total_perguntas" not in st.session_state:
+        st.session_state["total_perguntas"] = 0
+
+    if "langfuse_session_id" not in st.session_state:
+        st.session_state["langfuse_session_id"] = str(uuid.uuid4())
+
+    if st.session_state["total_perguntas"] >= LIMITE_PERGUNTAS:
+        st.warning("⚠️ Limite de perguntas desta sessão atingido. Reabra o app para continuar.")
+        return
+
     st.title("⚖️ Agente Jurídico Trabalhista")
     st.caption(
         "⚠️ Ferramenta de informação jurídica — não substitui consultoria de advogado habilitado."
     )
 
-    client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+    client    = get_genai_client()
+    langfuse  = get_langfuse()
 
     if "historico" not in st.session_state:
         st.session_state["historico"] = []
@@ -208,15 +314,21 @@ def main():
     with st.chat_message("assistant"):
         with st.spinner("Consultando legislação..."):
             try:
-                docs_recuperados = buscar_documentos(pergunta, vs, contexto)
-                docs_reranked    = rerank_documentos(pergunta, docs_recuperados, client)
-                resposta         = gerar_resposta(pergunta, docs_reranked, contexto, client)
+                resposta, docs_reranked = processar_pergunta(
+                    pergunta,
+                    vs,
+                    contexto,
+                    client,
+                    session_id=st.session_state["langfuse_session_id"],
+                )
             except ServerError:
                 st.error(
                     "⚠️ O serviço do Gemini está sobrecarregado no momento. "
                     "Tente novamente em alguns minutos."
                 )
                 return
+            finally:
+                langfuse.flush()
 
         st.markdown(resposta)
 
@@ -228,6 +340,7 @@ def main():
                 )
 
     st.session_state["historico"].append({"role": "assistant", "content": resposta})
+    st.session_state["total_perguntas"] += 1
 
 if __name__ == "__main__":
     main()
