@@ -84,22 +84,27 @@ def validar_pergunta(texto: str, historico: list) -> tuple[bool, str]:
 
     return True, ""
 
-def classificar_escopo(pergunta: str, client) -> bool:
-    prompt = f"""Você é um classificador. Responda APENAS com "sim" ou "nao", sem pontuação, sem explicação.
+def classificar_escopo(pergunta: str, client) -> str:
+    prompt = f"""Você é um classificador. Responda APENAS com uma das três opções abaixo, sem pontuação, sem explicação.
 
-A pergunta abaixo é sobre direito trabalhista, CLT, FGTS, férias, rescisão, salário, jornada de trabalho, vínculo empregatício, contrato de trabalho ou qualquer tema de legislação trabalhista brasileira?
+        Categorias:
+        - "trabalhista": a pergunta é sobre direito trabalhista, CLT, FGTS, férias, rescisão, salário, jornada, vínculo empregatício ou qualquer tema de legislação trabalhista brasileira.
+        - "relacionado": a pergunta envolve uma situação pessoal ou social (pensão alimentícia, divórcio, herança, saúde, etc.) mas o contexto indica que a pessoa pode estar buscando apoio no ambiente de trabalho ou perguntando em nome de um funcionário/colega.
+        - "fora_escopo": a pergunta não tem nenhuma relação com trabalho, funcionários ou legislação brasileira.
 
-Pergunta: "{pergunta}"
+        Pergunta: "{pergunta}"
 
-Responda somente: sim
-Ou somente: nao"""
+        Responda somente uma palavra: trabalhista, relacionado ou fora_escopo"""
 
     try:
         resposta = chamar_llm(client, prompt).strip().lower()
-        return resposta.startswith("sim")
+        if "trabalhista" in resposta:
+            return "trabalhista"
+        if "relacionado" in resposta:
+            return "relacionado"
+        return "fora_escopo"
     except Exception:
-        return True
-
+        return "trabalhista"
 
 @st.cache_resource
 def get_langfuse():
@@ -464,29 +469,40 @@ def main():
         with st.chat_message("user"):
             st.markdown(pergunta)
         st.session_state["historico"].append({"role": "user", "content": pergunta})
-        resposta_bloqueio = (
+        msg = (
             "Só consigo responder dúvidas sobre legislação trabalhista. "
             "Se tiver uma pergunta sobre direitos ou obrigações no trabalho, pode mandar! 👍"
         )
         with st.chat_message("assistant"):
-            st.markdown(resposta_bloqueio)
-        st.session_state["historico"].append({"role": "assistant", "content": resposta_bloqueio})
+            st.markdown(msg)
+        st.session_state["historico"].append({"role": "assistant", "content": msg})
         return
 
     with st.spinner("Verificando pergunta..."):
-        dentro_do_escopo = classificar_escopo(pergunta, client)
+        escopo = classificar_escopo(pergunta, client)
 
-    if not dentro_do_escopo:
-        with st.chat_message("user"):
-            st.markdown(pergunta)
-        st.session_state["historico"].append({"role": "user", "content": pergunta})
-        resposta_fora_escopo = (
+    if escopo == "fora_escopo":
+        msg = (
             "Só consigo ajudar com dúvidas sobre legislação trabalhista. "
             "Se tiver uma pergunta sobre direitos ou obrigações no trabalho, pode mandar! 👍"
         )
+    elif escopo == "relacionado":
+        msg = (
+            "Essa situação envolve direito de família, que está fora da minha área. "
+            "Para questões de pensão alimentícia, o caminho é buscar orientação com um advogado de família "
+            "ou na Defensoria Pública, que oferece atendimento gratuito. 🙏\n\n"
+            "Se surgir alguma dúvida sobre os direitos trabalhistas da sua funcionária em si, estou aqui!"
+        )
+    else:
+        msg = None
+
+    if msg:
+        with st.chat_message("user"):
+            st.markdown(pergunta)
+        st.session_state["historico"].append({"role": "user", "content": pergunta})
         with st.chat_message("assistant"):
-            st.markdown(resposta_fora_escopo)
-        st.session_state["historico"].append({"role": "assistant", "content": resposta_fora_escopo})
+            st.markdown(msg)
+        st.session_state["historico"].append({"role": "assistant", "content": msg})
         return
 
     with st.chat_message("user"):
