@@ -19,9 +19,50 @@ os.environ["LANGFUSE_SECRET_KEY"] = st.secrets["LANGFUSE_SECRET_KEY"]
 os.environ["LANGFUSE_HOST"]       = st.secrets.get("LANGFUSE_HOST", "https://cloud.langfuse.com")
 os.environ["GOOGLE_API_KEY"]      = st.secrets["GOOGLE_API_KEY"]
 
+MAPA_VINCULO = {
+    "CLT Geral":                 "clt_geral",
+    "Doméstico":                 "domestico",
+    "Estagiário":                "estagiario",
+    "Terceirizado / Temporário": "terceirizado",
+    "Autônomo / PJ":             "pj",
+}
+
+POLOS = {
+    "Empregado / Trabalhador":   "empregado",
+    "Empregador / Empresa / RH": "empregador",
+}
+
+PADROES_INJECTION = [
+    r"ignore\s+(tudo|todas|todos|o\s+que|as\s+instru[cç][oõ]es)",
+    r"esqueça\s+(tudo|o\s+que\s+foi|as\s+instru[cç][oõ]es|seu\s+papel)",
+    r"(ignore|forget|disregard)\s+(previous|prior|all|above|everything)",
+    r"(new|novo)\s+(prompt|instru[cç][aã]o|comando|role|papel|sistema)",
+    r"act\s+as\s+(?!a\s+lawyer|um\s+advogado)",
+    r"you\s+are\s+now",
+    r"(pretend|finja|simule?)\s+(que\s+)?(you\s+are|voc[eê]\s+[eé]|ser)",
+    r"system\s*:",
+    r"<\s*system\s*>",
+    r"\[system\]",
+    r"###\s*(instru[cç][oõ]es|instructions|prompt|system)",
+    r"(revele?|mostre?|exiba?|print|reveal|show)\s+(o\s+)?(prompt|instru[cç][oõ]es|system)",
+    r"(mude?|altere?|troque?|change|override)\s+(seu\s+)?(comportamento|papel|role|instru[cç][oõ]es)",
+    r"jailbreak",
+    r"dan\s+mode",
+    r"developer\s+mode",
+    r"modo\s+(desenvolvedor|irrestrito|livre|admin)",
+]
+
+_RE_INJECTION = re.compile(
+    "|".join(PADROES_INJECTION),
+    flags=re.IGNORECASE | re.UNICODE,
+)
+
+def detectar_injection(texto: str) -> bool:
+    return bool(_RE_INJECTION.search(texto))
+
+
 @st.cache_resource
 def get_langfuse():
-    """Cliente singleton thread-safe, conforme docs do Langfuse v3."""
     return get_client()
 
 @st.cache_resource
@@ -42,6 +83,7 @@ def carregar_vectorstore():
         embedding_function=embeddings
     )
 
+
 @retry(
     retry=retry_if_exception_type(ServerError),
     stop=stop_after_attempt(4),
@@ -49,7 +91,6 @@ def carregar_vectorstore():
     reraise=True,
 )
 def _gerar_com_modelo(client, prompt: str, modelo: str) -> str:
-    """Chama o Gemini e registra como `generation` no trace atual."""
     langfuse = get_langfuse()
     with langfuse.start_as_current_observation(
         as_type="generation",
@@ -81,52 +122,6 @@ def chamar_llm(client, prompt: str) -> str:
     except ServerError:
         return _gerar_com_modelo(client, prompt, LLM_MODEL_FALLBACK)
 
-def coletar_contexto_usuario():
-    with st.sidebar:
-        st.header("📋 Seu perfil")
-
-        polo = st.radio(
-            "Você é:",
-            ["Empregado / Trabalhador", "Empregador / Empresa / RH"],
-            key="polo"
-        )
-
-        tipo_vinculo = st.selectbox(
-            "Tipo de vínculo:",
-            ["CLT Geral", "Doméstico", "Estagiário", "Terceirizado / Temporário", "Autônomo / PJ"],
-            key="vinculo"
-        )
-
-        confirmado = st.button("✅ Confirmar perfil")
-
-        st.divider()
-        st.warning(
-            "**Aviso legal**\n\n"
-            "Este assistente fornece **informações jurídicas gerais** com base na "
-            "legislação vigente. Ele **não é um advogado** e **não substitui "
-            "consultoria jurídica profissional**.\n\n"
-            "Para orientação sobre seu caso concreto, consulte um advogado "
-            "trabalhista habilitado na OAB.",
-            icon="⚠️",
-        )
-
-    mapa_vinculo = {
-        "CLT Geral":                 "clt_geral",
-        "Doméstico":                 "domestico",
-        "Estagiário":                "estagiario",
-        "Terceirizado / Temporário": "terceirizado",
-        "Autônomo / PJ":             "pj",
-    }
-
-    if confirmado or st.session_state.get("perfil_confirmado"):
-        st.session_state["perfil_confirmado"] = True
-        return {
-            "polo":         "empregado" if "Empregado" in polo else "empregador",
-            "tipo_vinculo": mapa_vinculo[tipo_vinculo],
-        }
-
-    st.info("👈 Preencha seu perfil na barra lateral para começar.")
-    return None
 
 def buscar_documentos(pergunta: str, vectorstore, contexto: dict, k: int = 8):
     langfuse = get_langfuse()
@@ -241,8 +236,8 @@ def gerar_resposta(pergunta: str, documentos: list, contexto: dict, client) -> s
 
     return chamar_llm(client, prompt)
 
+
 def processar_pergunta(pergunta: str, vs, contexto: dict, client, session_id: str):
-    """Orquestra retrieval -> rerank -> generation dentro de um único trace."""
     langfuse = get_langfuse()
 
     with propagate_attributes(
@@ -259,51 +254,174 @@ def processar_pergunta(pergunta: str, vs, contexto: dict, client, session_id: st
             name="pipeline_juridico",
             input=pergunta,
         ) as trace_root:
-            docs            = buscar_documentos(pergunta, vs, contexto)
-            docs_reranked   = rerank_documentos(pergunta, docs, client)
-            resposta        = gerar_resposta(pergunta, docs_reranked, contexto, client)
+            docs          = buscar_documentos(pergunta, vs, contexto)
+            docs_reranked = rerank_documentos(pergunta, docs, client)
+            resposta      = gerar_resposta(pergunta, docs_reranked, contexto, client)
 
             trace_root.update(output=resposta)
             return resposta, docs_reranked
 
+
+def inicializar_onboarding():
+    if not st.session_state["historico"]:
+        st.session_state["historico"].append({
+            "role": "assistant",
+            "content": (
+                "Olá! 👋 Sou um assistente jurídico trabalhista. "
+                "Antes de começar, preciso entender seu perfil para dar respostas mais precisas.\n\n"
+                "**Você é empregado ou empregador?**"
+            ),
+        })
+
+def renderizar_botoes_polo():
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("👷 Empregado / Trabalhador", use_container_width=True, key="btn_empregado"):
+            return "Empregado / Trabalhador"
+    with col2:
+        if st.button("🏢 Empregador / Empresa / RH", use_container_width=True, key="btn_empregador"):
+            return "Empregador / Empresa / RH"
+    return None
+
+def renderizar_botoes_vinculo():
+    opcoes = list(MAPA_VINCULO.keys())
+    cols = st.columns(2)
+    escolhido = None
+    for i, opcao in enumerate(opcoes):
+        with cols[i % 2]:
+            if st.button(opcao, use_container_width=True, key=f"btn_vinculo_{i}"):
+                escolhido = opcao
+    return escolhido
+
+def avancar_para_vinculo(polo_label: str):
+    st.session_state["polo_confirmado"] = POLOS[polo_label]
+    st.session_state["historico"].append({"role": "user", "content": polo_label})
+    st.session_state["historico"].append({
+        "role": "assistant",
+        "content": (
+            "Perfeito! Agora me diga: **qual é o tipo de vínculo?**\n\n"
+            "Isso me ajuda a focar nas leis certas para o seu caso."
+        ),
+    })
+    st.session_state["estado"] = "onboarding_vinculo"
+
+def avancar_para_conversa(vinculo_label: str):
+    st.session_state["vinculo_confirmado"]       = MAPA_VINCULO[vinculo_label]
+    st.session_state["vinculo_label_confirmado"] = vinculo_label
+    st.session_state["historico"].append({"role": "user", "content": vinculo_label})
+
+    polo_humano = "trabalhador" if st.session_state["polo_confirmado"] == "empregado" else "empregador"
+    st.session_state["historico"].append({
+        "role": "assistant",
+        "content": (
+            f"Anotado: **{polo_humano}** com vínculo **{vinculo_label}**.\n\n"
+            "Agora pode mandar sua dúvida trabalhista. Vou consultar a legislação "
+            "e te dar uma resposta fundamentada. 📚"
+        ),
+    })
+    st.session_state["estado"] = "conversando"
+
+def trocar_perfil():
+    st.session_state["historico"] = []
+    st.session_state["estado"]    = "onboarding_polo"
+    st.session_state.pop("polo_confirmado", None)
+    st.session_state.pop("vinculo_confirmado", None)
+    st.session_state.pop("vinculo_label_confirmado", None)
+    inicializar_onboarding()
+
+
 def main():
-    st.set_page_config(page_title="Agente Jurídico Trabalhista", page_icon="⚖️")
+    st.set_page_config(
+        page_title="Agente Jurídico Trabalhista",
+        page_icon="⚖️",
+        initial_sidebar_state="collapsed",
+    )
 
     LIMITE_PERGUNTAS = 5
 
     if "total_perguntas" not in st.session_state:
         st.session_state["total_perguntas"] = 0
-
+    if "estado" not in st.session_state:
+        st.session_state["estado"] = "onboarding_polo"
+    if "historico" not in st.session_state:
+        st.session_state["historico"] = []
     if "langfuse_session_id" not in st.session_state:
         st.session_state["langfuse_session_id"] = str(uuid.uuid4())
 
-    if st.session_state["total_perguntas"] >= LIMITE_PERGUNTAS:
-        st.warning("⚠️ Limite de perguntas desta sessão atingido. Reabra o app para continuar.")
-        return
-
     st.title("⚖️ Agente Jurídico Trabalhista")
     st.caption(
-        "⚠️ Ferramenta de informação jurídica — não substitui consultoria de advogado habilitado."
+        "⚠️ Ferramenta de informação jurídica. Não substitui consultoria de advogado habilitado."
     )
 
-    client    = get_genai_client()
-    langfuse  = get_langfuse()
+    inicializar_onboarding()
 
-    if "historico" not in st.session_state:
-        st.session_state["historico"] = []
-
-    contexto = coletar_contexto_usuario()
-    if not contexto:
-        return
-
-    vs = carregar_vectorstore()
+    if st.session_state["estado"] == "conversando":
+        polo_label    = "Empregado" if st.session_state["polo_confirmado"] == "empregado" else "Empregador"
+        vinculo_label = st.session_state["vinculo_label_confirmado"]
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.caption(f"👤 **{polo_label}** · 📄 **{vinculo_label}**")
+        with col2:
+            if st.button("🔄 Trocar", use_container_width=True, key="btn_trocar_perfil"):
+                trocar_perfil()
+                st.rerun()
+        st.divider()
 
     for msg in st.session_state["historico"]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
+    if st.session_state["estado"] == "onboarding_polo":
+        escolha = renderizar_botoes_polo()
+        if escolha:
+            avancar_para_vinculo(escolha)
+            st.rerun()
+        with st.expander("⚠️ Aviso legal importante"):
+            st.markdown(
+                "Este assistente fornece **informações jurídicas gerais** com base na "
+                "legislação vigente. Ele **não é um advogado** e **não substitui "
+                "consultoria jurídica profissional**.\n\n"
+                "Para orientação sobre seu caso concreto, consulte um advogado "
+                "trabalhista habilitado na OAB."
+            )
+        return
+
+    if st.session_state["estado"] == "onboarding_vinculo":
+        escolha = renderizar_botoes_vinculo()
+        if escolha:
+            avancar_para_conversa(escolha)
+            st.rerun()
+        return
+
+    if st.session_state["total_perguntas"] >= LIMITE_PERGUNTAS:
+        st.warning("⚠️ Limite de perguntas desta sessão atingido. Reabra o app para continuar.")
+        return
+
+    contexto = {
+        "polo":         st.session_state["polo_confirmado"],
+        "tipo_vinculo": st.session_state["vinculo_confirmado"],
+    }
+
+    client   = get_genai_client()
+    langfuse = get_langfuse()
+    vs       = carregar_vectorstore()
+
     pergunta = st.chat_input("Digite sua dúvida trabalhista...")
     if not pergunta:
+        return
+
+    if detectar_injection(pergunta):
+        with st.chat_message("user"):
+            st.markdown(pergunta)
+        st.session_state["historico"].append({"role": "user", "content": pergunta})
+
+        resposta_bloqueio = (
+            "Só consigo responder dúvidas sobre legislação trabalhista. "
+            "Se tiver uma pergunta sobre direitos ou obrigações no trabalho, pode mandar! 👍"
+        )
+        with st.chat_message("assistant"):
+            st.markdown(resposta_bloqueio)
+        st.session_state["historico"].append({"role": "assistant", "content": resposta_bloqueio})
         return
 
     with st.chat_message("user"):
