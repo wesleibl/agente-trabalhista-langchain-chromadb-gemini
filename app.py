@@ -250,7 +250,8 @@ def processar_pergunta(pergunta: str, vs, contexto: dict, client, session_id: st
         name="pipeline_juridico",
         input=pergunta,
     ) as trace_root:
-        langfuse.update_current_trace(
+        # Metadados do trace raiz (funciona em SDK v3 e v4)
+        trace_root.update_trace(
             session_id=session_id,
             user_id=f"{contexto['polo']}__{contexto['tipo_vinculo']}",
             tags=[contexto["polo"], contexto["tipo_vinculo"]],
