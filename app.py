@@ -6,7 +6,7 @@ from langchain_community.vectorstores import Chroma
 from google import genai
 from google.genai.errors import ServerError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from langfuse import get_client
+from langfuse import get_client, propagate_attributes
 
 PERSIST_DIRECTORY  = "./chroma_rh"
 EMBEDDING_MODEL    = "models/gemini-embedding-001"
@@ -245,28 +245,26 @@ def processar_pergunta(pergunta: str, vs, contexto: dict, client, session_id: st
     """Orquestra retrieval -> rerank -> generation dentro de um único trace."""
     langfuse = get_langfuse()
 
-    with langfuse.start_as_current_observation(
-        as_type="span",
-        name="pipeline_juridico",
-        input=pergunta,
-    ) as trace_root:
-        # Metadados do trace raiz (funciona em SDK v3 e v4)
-        trace_root.update_trace(
-            session_id=session_id,
-            user_id=f"{contexto['polo']}__{contexto['tipo_vinculo']}",
-            tags=[contexto["polo"], contexto["tipo_vinculo"]],
-            metadata={
-                "polo": contexto["polo"],
-                "tipo_vinculo": contexto["tipo_vinculo"],
-            },
-        )
+    with propagate_attributes(
+        session_id=session_id,
+        user_id=f"{contexto['polo']}__{contexto['tipo_vinculo']}",
+        tags=[contexto["polo"], contexto["tipo_vinculo"]],
+        metadata={
+            "polo": contexto["polo"],
+            "tipo_vinculo": contexto["tipo_vinculo"],
+        },
+    ):
+        with langfuse.start_as_current_observation(
+            as_type="span",
+            name="pipeline_juridico",
+            input=pergunta,
+        ) as trace_root:
+            docs            = buscar_documentos(pergunta, vs, contexto)
+            docs_reranked   = rerank_documentos(pergunta, docs, client)
+            resposta        = gerar_resposta(pergunta, docs_reranked, contexto, client)
 
-        docs            = buscar_documentos(pergunta, vs, contexto)
-        docs_reranked   = rerank_documentos(pergunta, docs, client)
-        resposta        = gerar_resposta(pergunta, docs_reranked, contexto, client)
-
-        trace_root.update(output=resposta)
-        return resposta, docs_reranked
+            trace_root.update(output=resposta)
+            return resposta, docs_reranked
 
 def main():
     st.set_page_config(page_title="Agente Jurídico Trabalhista", page_icon="⚖️")
