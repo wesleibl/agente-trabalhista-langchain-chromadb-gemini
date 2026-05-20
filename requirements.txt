@@ -6,3 +6,5 @@ streamlit
 chromadb
 pypdf
 dotenv
+beautifulsoup4
+lxml

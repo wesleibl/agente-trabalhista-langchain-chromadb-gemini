@@ -29,6 +29,8 @@ FONTES_URL = {
     "previdencia-social.htm":  "https://www.planalto.gov.br/ccivil_03/leis/l8213cons.htm",
     "tercerizada.htm":         "https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2017/lei/l13429.htm",
     "trabalho-domestico.htm":  "https://www.planalto.gov.br/ccivil_03/leis/lcp/lcp150.htm",
+    "codigo-civil.htm": "https://www.planalto.gov.br/ccivil_03/leis/2002/l10406compilada.htm",
+
 }
 
 FONTE_POR_ARQUIVO = {
@@ -39,6 +41,8 @@ FONTE_POR_ARQUIVO = {
     "previdencia-social.htm":  ("Lei_Previdencia",       "Lei 8.213/1991",         "geral"),
     "tercerizada.htm":         ("Lei_Terceirizacao",     "Lei 13.429/2017",        "terceirizado"),
     "trabalho-domestico.htm":  ("Lei_Domestico",         "LC 150/2015",            "domestico"),
+    "codigo-civil.htm":        ("Codigo_Civil",          "Lei 10.406/2002",        "pj"),
+
 }
 
 MAPA_TEMATICO = {
@@ -51,6 +55,12 @@ MAPA_TEMATICO = {
         "horas_extras":   ["hora extra", "sobrejornada", "servico extraordinario", "jornada suplementar"],
         "banco_de_horas": ["banco de horas", "compensacao"],
         "intervalos":     ["intervalo", "intrajornada", "interjornada", "descanso"],
+    },
+    "vinculo_empregaticio": {
+        "subordinacao":   ["subordinacao", "subordinado", "dependencia"],
+        "habitualidade":  ["habitualidade", "nao eventual", "continuidade"],
+        "pessoalidade":   ["pessoalidade", "pessoal"],
+        "pejotizacao":    ["fraude", "vinculo empregaticio", "reconhecimento de vinculo"],
     },
     "modalidades_contrato": {
         "home_office": ["home office", "teletrabalho", "hibrido"],
@@ -65,6 +75,7 @@ MAPA_TEMATICO = {
     "encargos_e_tributos": {
         "fgts": ["fgts", "fundo de garantia", "multa de 40"],
     },
+    
 }
 
 def ler_registro() -> dict:
