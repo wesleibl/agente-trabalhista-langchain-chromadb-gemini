@@ -4,6 +4,10 @@ Assistente conversacional de direito do trabalho construído sobre uma pipeline 
 
 ---
 
+## Teste
+
+Teste diretamente por este link: [agente-trabalhista](https://agente-trabalhista.streamlit.app/)
+
 ## Demonstração
 
 ```
