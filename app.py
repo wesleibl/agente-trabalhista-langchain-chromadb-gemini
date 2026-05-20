@@ -3,14 +3,33 @@ import re
 import streamlit as st
 from langchain_community.vectorstores import Chroma
 from google import genai
+from google.genai.errors import ServerError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from dotenv import load_dotenv
 
 load_dotenv()
 
-PERSIST_DIRECTORY = "./chroma_rh"
-EMBEDDING_MODEL   = "models/gemini-embedding-001"
-LLM_MODEL         = "gemini-2.5-flash-lite"
-BASE_DIR          = os.path.dirname(os.path.abspath(__file__))
+PERSIST_DIRECTORY  = "./chroma_rh"
+EMBEDDING_MODEL    = "models/gemini-embedding-001"
+LLM_MODEL          = "gemini-2.5-flash"
+LLM_MODEL_FALLBACK = "gemini-2.5-flash-lite"
+BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
+
+@retry(
+    retry=retry_if_exception_type(ServerError),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=2, min=3, max=20),
+    reraise=True,
+)
+def _gerar_com_modelo(client, prompt: str, modelo: str) -> str:
+    response = client.models.generate_content(model=modelo, contents=prompt)
+    return response.text
+
+def chamar_llm(client, prompt: str) -> str:
+    try:
+        return _gerar_com_modelo(client, prompt, LLM_MODEL)
+    except ServerError:
+        return _gerar_com_modelo(client, prompt, LLM_MODEL_FALLBACK)
 
 def coletar_contexto_usuario():
     with st.sidebar:
@@ -30,12 +49,23 @@ def coletar_contexto_usuario():
 
         confirmado = st.button("✅ Confirmar perfil")
 
+        st.divider()
+        st.warning(
+            "**Aviso legal**\n\n"
+            "Este assistente fornece **informações jurídicas gerais** com base na "
+            "legislação vigente. Ele **não é um advogado** e **não substitui "
+            "consultoria jurídica profissional**.\n\n"
+            "Para orientação sobre seu caso concreto, consulte um advogado "
+            "trabalhista habilitado na OAB.",
+            icon="⚠️",
+        )
+
     mapa_vinculo = {
         "CLT Geral":                 "clt_geral",
         "Doméstico":                 "domestico",
         "Estagiário":                "estagiario",
         "Terceirizado / Temporário": "terceirizado",
-        "Autônomo / PJ":             "geral",
+        "Autônomo / PJ":             "pj",
     }
 
     if confirmado or st.session_state.get("perfil_confirmado"):
@@ -63,14 +93,16 @@ def carregar_vectorstore():
     )
 
 def buscar_documentos(pergunta: str, vectorstore, contexto: dict, k: int = 8):
-    filtro = {}
     tipo = contexto.get("tipo_vinculo", "geral")
 
-    if tipo != "geral":
-        filtro["tipo_trabalhador"] = {"$in": [tipo, "clt_geral", "geral"]}
-
-    if filtro:
+    if tipo == "pj":
+        filtro = {"tipo_trabalhador": {"$in": ["pj", "geral"]}}
         return vectorstore.similarity_search(pergunta, k=k, filter=filtro)
+
+    if tipo != "geral":
+        filtro = {"tipo_trabalhador": {"$in": [tipo, "clt_geral", "geral"]}}
+        return vectorstore.similarity_search(pergunta, k=k, filter=filtro)
+
     return vectorstore.similarity_search(pergunta, k=k)
 
 def rerank_documentos(pergunta: str, documentos: list, client) -> list:
@@ -81,23 +113,23 @@ def rerank_documentos(pergunta: str, documentos: list, client) -> list:
         trechos += f"\n[{i}] {fonte} — {artigo}:\n{doc.page_content[:400]}\n"
 
     prompt = f"""Você é um avaliador jurídico trabalhista.
-Dada a pergunta abaixo, avalie cada trecho numerado de 0 a 10 por relevância.
-0 = irrelevante, 10 = responde diretamente a pergunta.
+        Dada a pergunta abaixo, avalie cada trecho numerado de 0 a 10 por relevância.
+        0 = irrelevante, 10 = responde diretamente a pergunta.
 
-Pergunta: "{pergunta}"
+        Pergunta: "{pergunta}"
 
-Trechos:
-{trechos}
+        Trechos:
+        {trechos}
 
-Responda APENAS neste formato, um por linha, sem explicações:
-1: <nota>
-2: <nota>
-3: <nota>"""
+        Responda APENAS neste formato, um por linha, sem explicações:
+        1: <nota>
+        2: <nota>
+        3: <nota>"""
 
-    response = client.models.generate_content(model=LLM_MODEL, contents=prompt)
+    texto_resposta = chamar_llm(client, prompt)
 
     notas = {}
-    for linha in response.text.strip().split("\n"):
+    for linha in texto_resposta.strip().split("\n"):
         match = re.match(r'(\d+):\s*([\d.]+)', linha)
         if match:
             notas[int(match.group(1))] = float(match.group(2))
@@ -114,30 +146,41 @@ def gerar_resposta(pergunta: str, documentos: list, contexto: dict, client: gena
         artigo = doc.metadata.get("artigo", "N/A")
         contexto_juridico += f"\n[{i}] {fonte} — {artigo}:\n{doc.page_content[:600]}\n"
 
-    prompt = f"""Você é um assistente jurídico trabalhista especializado.
-Responda à pergunta abaixo de forma clara e objetiva, citando os artigos e leis relevantes.
+    prompt = f"""Você é um assistente jurídico trabalhista. Responda de forma clara, objetiva e fundamentada.
 
-Perfil do usuário: {polo_label} — vínculo: {contexto['tipo_vinculo']}
+        Perfil do usuário: {polo_label} — vínculo: {contexto['tipo_vinculo']}
 
-Pergunta: "{pergunta}"
+        Pergunta: "{pergunta}"
 
-Legislação relevante encontrada:
-{contexto_juridico}
+        Legislação encontrada:
+        {contexto_juridico}
 
-Instruções:
-- SEMPRE informe brevemente que você é uma IA e que não é um profissional formado em direito.
-- SEMPRE mantenha o idioma português, mesmo que a pergunta seja em outro idioma.
-- Cite os artigos no formato: (Art. X — Nome da Lei)
-- Indique claramente os direitos e obrigações para o perfil informado
-- Se houver diferença de tratamento entre empregado e empregador, destaque
-- Seja objetivo, evite jargão excessivo"""
+        ESTRUTURA DA RESPOSTA (siga esta ordem, em prosa fluida):
 
-    response = client.models.generate_content(model=LLM_MODEL, contents=prompt)
-    return response.text
+        1. Resposta direta (1-2 frases): responda objetivamente o que foi perguntado.
+        2. Fundamentação legal (2-4 parágrafos curtos): explique a base jurídica citando artigos da legislação encontrada acima. Use o formato (Art. X — Nome da Lei).
+        3. Orientação prática (1-2 frases): o que o usuário deve fazer ou observar na prática.
+
+        REGRAS:
+        - FOQUE no perfil do usuário ({contexto['tipo_vinculo']}). Mencione outros vínculos APENAS se for essencial para comparação direta.
+        - Se o vínculo for "pj" e a pergunta envolver subordinação, horários, habitualidade ou rotina fixa, ALERTE sobre possível configuração de vínculo empregatício (Art. 3º da CLT) e os riscos da pejotização para ambas as partes.
+        - Mantenha sempre o português, mesmo se a pergunta vier em outro idioma.
+        - Use os artigos da legislação encontrada — não invente artigos.
+        - NÃO mencione ao usuário se um artigo está ou não presente nos materiais fornecidos. Apenas cite os artigos relevantes naturalmente, como se fizessem parte do seu conhecimento jurídico.
+        - NÃO use frases como "não presente nos materiais", "conforme o contexto fornecido", "com base nos trechos" ou similares. Responda como um especialista, sem expor a mecânica interna do sistema.
+        - NÃO numere os blocos da resposta (não escreva "1. Resposta direta", "2. Fundamentação"). Use prosa fluida com parágrafos.
+        - Seja objetivo. Evite jargão excessivo e textos longos demais.
+        - Termine com UMA linha curta: "_Informação geral — para seu caso, consulte um advogado trabalhista._"
+        - NÃO se apresente como IA — o app já informa isso ao usuário."""
+
+    return chamar_llm(client, prompt)
 
 def main():
     st.set_page_config(page_title="Agente Jurídico Trabalhista", page_icon="⚖️")
     st.title("⚖️ Agente Jurídico Trabalhista")
+    st.caption(
+        "⚠️ Ferramenta de informação jurídica — não substitui consultoria de advogado habilitado."
+    )
 
     client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
 
@@ -150,12 +193,10 @@ def main():
 
     vs = carregar_vectorstore()
 
-    # Exibe histórico
     for msg in st.session_state["historico"]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Input da pergunta
     pergunta = st.chat_input("Digite sua dúvida trabalhista...")
     if not pergunta:
         return
@@ -165,19 +206,17 @@ def main():
     st.session_state["historico"].append({"role": "user", "content": pergunta})
 
     with st.chat_message("assistant"):
-        with st.status("Consultando legislação...", expanded=True) as status:
-
-            st.write("📚 Step 2 — Buscando legislação relevante...")
-            docs_recuperados = buscar_documentos(pergunta, vs, contexto)
-            st.caption(f"{len(docs_recuperados)} trechos encontrados")
-
-            st.write("⚖️ Step 3 — Reordenando por relevância...")
-            docs_reranked = rerank_documentos(pergunta, docs_recuperados, client)
-
-            st.write("✍️ Step 4 — Gerando resposta com citações...")
-            resposta = gerar_resposta(pergunta, docs_reranked, contexto, client)
-
-            status.update(label="✅ Consulta concluída!", state="complete")
+        with st.spinner("Consultando legislação..."):
+            try:
+                docs_recuperados = buscar_documentos(pergunta, vs, contexto)
+                docs_reranked    = rerank_documentos(pergunta, docs_recuperados, client)
+                resposta         = gerar_resposta(pergunta, docs_reranked, contexto, client)
+            except ServerError:
+                st.error(
+                    "⚠️ O serviço do Gemini está sobrecarregado no momento. "
+                    "Tente novamente em alguns minutos."
+                )
+                return
 
         st.markdown(resposta)
 

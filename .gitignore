@@ -1,5 +1,6 @@
 .env
 chroma_db/
+chroma_rh/
 .venv/
 __pycache__/
-*.pyc
+*.pycchroma_rh/
