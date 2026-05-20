@@ -84,6 +84,22 @@ def validar_pergunta(texto: str, historico: list) -> tuple[bool, str]:
 
     return True, ""
 
+def classificar_escopo(pergunta: str, client) -> bool:
+    prompt = f"""Você é um classificador. Responda APENAS com "sim" ou "nao", sem pontuação, sem explicação.
+
+A pergunta abaixo é sobre direito trabalhista, CLT, FGTS, férias, rescisão, salário, jornada de trabalho, vínculo empregatício, contrato de trabalho ou qualquer tema de legislação trabalhista brasileira?
+
+Pergunta: "{pergunta}"
+
+Responda somente: sim
+Ou somente: nao"""
+
+    try:
+        resposta = chamar_llm(client, prompt).strip().lower()
+        return resposta.startswith("sim")
+    except Exception:
+        return True
+
 
 @st.cache_resource
 def get_langfuse():
@@ -255,7 +271,6 @@ def gerar_resposta(pergunta: str, documentos: list, contexto: dict, client) -> s
         - NÃO use frases como "não presente nos materiais", "conforme o contexto fornecido", "com base nos trechos" ou similares. Responda como um especialista, sem expor a mecânica interna do sistema.
         - NÃO numere os blocos da resposta (não escreva "1. Resposta direta", "2. Fundamentação"). Use prosa fluida com parágrafos.
         - Seja objetivo. Evite jargão excessivo e textos longos demais.
-        - Se a pergunta não tiver relação com direito trabalhista, CLT, contratos de trabalho, FGTS, férias, rescisão, salário, jornada ou qualquer outro tema de legislação trabalhista brasileira, NÃO responda o conteúdo da pergunta. Responda apenas: "Só consigo ajudar com dúvidas sobre legislação trabalhista. Se tiver uma dúvida sobre seus direitos ou obrigações no trabalho, pode mandar!"
         - Termine com UMA linha curta: "_Informação geral — para seu caso, consulte um advogado trabalhista._"
         - NÃO se apresente como IA — o app já informa isso ao usuário."""
 
@@ -456,6 +471,22 @@ def main():
         with st.chat_message("assistant"):
             st.markdown(resposta_bloqueio)
         st.session_state["historico"].append({"role": "assistant", "content": resposta_bloqueio})
+        return
+
+    with st.spinner("Verificando pergunta..."):
+        dentro_do_escopo = classificar_escopo(pergunta, client)
+
+    if not dentro_do_escopo:
+        with st.chat_message("user"):
+            st.markdown(pergunta)
+        st.session_state["historico"].append({"role": "user", "content": pergunta})
+        resposta_fora_escopo = (
+            "Só consigo ajudar com dúvidas sobre legislação trabalhista. "
+            "Se tiver uma pergunta sobre direitos ou obrigações no trabalho, pode mandar! 👍"
+        )
+        with st.chat_message("assistant"):
+            st.markdown(resposta_fora_escopo)
+        st.session_state["historico"].append({"role": "assistant", "content": resposta_fora_escopo})
         return
 
     with st.chat_message("user"):
